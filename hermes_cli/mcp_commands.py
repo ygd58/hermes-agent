@@ -1,12 +1,3 @@
-"""
-CLI command: hermes mcp-server
-
-Add to hermes_cli/commands.py:
-
-    from hermes_cli.mcp_commands import click_mcp_server_command
-    cli.add_command(click_mcp_server_command)
-"""
-
 from __future__ import annotations
 
 import sys
