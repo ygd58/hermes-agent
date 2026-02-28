@@ -32,16 +32,11 @@ from toolsets import resolve_toolset, validate_toolset
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Async Bridging  (single source of truth -- used by registry.dispatch too)
-# =============================================================================
-
 def _run_async(coro):
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
-
     if loop and loop.is_running():
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -49,10 +44,6 @@ def _run_async(coro):
             return future.result(timeout=300)
     return asyncio.run(coro)
 
-
-# =============================================================================
-# Tool Discovery  (importing each module triggers its registry.register calls)
-# =============================================================================
 
 def _discover_tools():
     _modules = [
@@ -77,6 +68,7 @@ def _discover_tools():
         "tools.process_registry",
         "tools.send_message_tool",
         "tools.notification_tool",
+        "tools.pomodoro_tool",
     ]
     import importlib
     for mod_name in _modules:
@@ -88,21 +80,9 @@ def _discover_tools():
 
 _discover_tools()
 
-
-# =============================================================================
-# Backward-compat constants  (built once after discovery)
-# =============================================================================
-
 TOOL_TO_TOOLSET_MAP: Dict[str, str] = registry.get_tool_to_toolset_map()
-
 TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
-
 _last_resolved_tool_names: List[str] = []
-
-
-# =============================================================================
-# Legacy toolset name mapping
-# =============================================================================
 
 _LEGACY_TOOLSET_MAP = {
     "web_tools": ["web_search", "web_extract"],
@@ -130,10 +110,6 @@ _LEGACY_TOOLSET_MAP = {
 }
 
 
-# =============================================================================
-# get_tool_definitions
-# =============================================================================
-
 def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
@@ -156,12 +132,10 @@ def get_tool_definitions(
             else:
                 if not quiet_mode:
                     print(f"⚠️  Unknown toolset: {toolset_name}")
-
     elif disabled_toolsets:
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
-
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -192,13 +166,8 @@ def get_tool_definitions(
 
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
-
     return filtered_tools
 
-
-# =============================================================================
-# handle_function_call
-# =============================================================================
 
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 
@@ -212,45 +181,34 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
-
         if function_name == "execute_code":
             return registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
                 enabled_tools=_last_resolved_tool_names,
             )
-
         return registry.dispatch(
             function_name, function_args,
             task_id=task_id,
             user_task=user_task,
         )
-
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg}, ensure_ascii=False)
 
 
-# =============================================================================
-# Backward-compat wrapper functions
-# =============================================================================
-
 def get_all_tool_names() -> List[str]:
     return registry.get_all_tool_names()
-
 
 def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     return registry.get_toolset_for_tool(tool_name)
 
-
 def get_available_toolsets() -> Dict[str, dict]:
     return registry.get_available_toolsets()
 
-
 def check_toolset_requirements() -> Dict[str, bool]:
     return registry.check_toolset_requirements()
-
 
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     return registry.check_tool_availability(quiet=quiet)
