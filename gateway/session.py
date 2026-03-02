@@ -44,6 +44,7 @@ class SessionSource:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
+    chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     
     @property
     def description(self) -> str:
@@ -75,6 +76,7 @@ class SessionSource:
             "user_id": self.user_id,
             "user_name": self.user_name,
             "thread_id": self.thread_id,
+            "chat_topic": self.chat_topic,
         }
     
     @classmethod
@@ -87,6 +89,7 @@ class SessionSource:
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
+            chat_topic=data.get("chat_topic"),
         )
     
     @classmethod
@@ -154,6 +157,16 @@ def build_session_context_prompt(context: SessionContext) -> str:
         lines.append(f"**Source:** {platform_name} (the machine running this agent)")
     else:
         lines.append(f"**Source:** {platform_name} ({context.source.description})")
+    
+    # Channel topic (if available - provides context about the channel's purpose)
+    if context.source.chat_topic:
+        lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+
+    # User identity (especially useful for WhatsApp where multiple people DM)
+    if context.source.user_name:
+        lines.append(f"**User:** {context.source.user_name}")
+    elif context.source.user_id:
+        lines.append(f"**User ID:** {context.source.user_id}")
     
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
@@ -277,12 +290,14 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None,
+                 on_auto_reset=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         self._has_active_processes_fn = has_active_processes_fn
+        self._on_auto_reset = on_auto_reset  # callback(old_entry) before auto-reset
         
         # Initialize SQLite session database
         self._db = None
@@ -323,8 +338,12 @@ class SessionStore:
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
         platform = source.platform.value
-        
+
         if source.chat_type == "dm":
+            # WhatsApp DMs come from different people, each needs its own session.
+            # Other platforms (Telegram, Discord) have a single DM with the bot owner.
+            if platform == "whatsapp" and source.chat_id:
+                return f"agent:main:{platform}:dm:{source.chat_id}"
             return f"agent:main:{platform}:dm"
         else:
             return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}"
@@ -344,6 +363,9 @@ class SessionStore:
             platform=source.platform,
             session_type=source.chat_type
         )
+        
+        if policy.mode == "none":
+            return False
         
         now = datetime.now()
         
@@ -396,8 +418,13 @@ class SessionStore:
                 self._save()
                 return entry
             else:
-                # Session is being reset -- end the old one in SQLite
+                # Session is being auto-reset — flush memories before destroying
                 was_auto_reset = True
+                if self._on_auto_reset:
+                    try:
+                        self._on_auto_reset(entry)
+                    except Exception as e:
+                        logger.debug("Auto-reset callback failed: %s", e)
                 if self._db:
                     try:
                         self._db.end_session(entry.session_id, "session_reset")
@@ -547,6 +574,34 @@ class SessionStore:
         with open(transcript_path, "a") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
     
+    def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Replace the entire transcript for a session with new messages.
+        
+        Used by /retry, /undo, and /compress to persist modified conversation history.
+        Rewrites both SQLite and legacy JSONL storage.
+        """
+        # SQLite: clear old messages and re-insert
+        if self._db:
+            try:
+                self._db.clear_messages(session_id)
+                for msg in messages:
+                    self._db.append_message(
+                        session_id=session_id,
+                        role=msg.get("role", "unknown"),
+                        content=msg.get("content"),
+                        tool_name=msg.get("tool_name"),
+                        tool_calls=msg.get("tool_calls"),
+                        tool_call_id=msg.get("tool_call_id"),
+                    )
+            except Exception as e:
+                logger.debug("Failed to rewrite transcript in DB: %s", e)
+        
+        # JSONL: overwrite the file
+        transcript_path = self.get_transcript_path(session_id)
+        with open(transcript_path, "w") as f:
+            for msg in messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
         # Try SQLite first

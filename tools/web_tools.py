@@ -48,7 +48,7 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from firecrawl import Firecrawl
 from openai import AsyncOpenAI
-from agent.auxiliary_client import get_text_auxiliary_client
+from agent.auxiliary_client import get_async_text_auxiliary_client
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
@@ -67,21 +67,9 @@ def _get_firecrawl_client():
 
 DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
 
-# Resolve auxiliary text client at module level; build an async wrapper.
-_aux_sync_client, DEFAULT_SUMMARIZER_MODEL = get_text_auxiliary_client()
-_aux_async_client: AsyncOpenAI | None = None
-if _aux_sync_client is not None:
-    _async_kwargs = {
-        "api_key": _aux_sync_client.api_key,
-        "base_url": str(_aux_sync_client.base_url),
-    }
-    if "openrouter" in str(_aux_sync_client.base_url).lower():
-        _async_kwargs["default_headers"] = {
-            "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
-            "X-OpenRouter-Title": "Hermes Agent",
-            "X-OpenRouter-Categories": "cli-agent",
-        }
-    _aux_async_client = AsyncOpenAI(**_async_kwargs)
+# Resolve async auxiliary client at module level.
+# Handles Codex Responses API adapter transparently.
+_aux_async_client, DEFAULT_SUMMARIZER_MODEL = get_async_text_auxiliary_client()
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
 
@@ -174,7 +162,7 @@ async def _call_summarizer_llm(
     content: str, 
     context_str: str, 
     model: str, 
-    max_tokens: int = 4000,
+    max_tokens: int = 20000,
     is_chunk: bool = False,
     chunk_info: str = ""
 ) -> Optional[str]:
@@ -242,7 +230,7 @@ Create a markdown summary that captures all key information in a well-organized,
             if _aux_async_client is None:
                 logger.warning("No auxiliary model available for web content processing")
                 return None
-            from agent.auxiliary_client import get_auxiliary_extra_body
+            from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
             _extra = get_auxiliary_extra_body()
             response = await _aux_async_client.chat.completions.create(
                 model=model,
@@ -251,7 +239,7 @@ Create a markdown summary that captures all key information in a well-organized,
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.1,
-                max_tokens=max_tokens,
+                **auxiliary_max_tokens_param(max_tokens),
                 **({} if not _extra else {"extra_body": _extra}),
             )
             return response.choices[0].message.content.strip()
@@ -306,7 +294,7 @@ async def _process_large_content_chunked(
                 chunk_content, 
                 context_str, 
                 model, 
-                max_tokens=2000,
+                max_tokens=10000,
                 is_chunk=True,
                 chunk_info=chunk_info
             )
@@ -365,7 +353,7 @@ Create a single, unified markdown summary."""
                 fallback = fallback[:max_output_size] + "\n\n[... truncated ...]"
             return fallback
 
-        from agent.auxiliary_client import get_auxiliary_extra_body
+        from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
         _extra = get_auxiliary_extra_body()
         response = await _aux_async_client.chat.completions.create(
             model=model,
@@ -374,7 +362,7 @@ Create a single, unified markdown summary."""
                 {"role": "user", "content": synthesis_prompt}
             ],
             temperature=0.1,
-            max_tokens=4000,
+            **auxiliary_max_tokens_param(20000),
             **({} if not _extra else {"extra_body": _extra}),
         )
         final_summary = response.choices[0].message.content.strip()
@@ -1240,7 +1228,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns page content in markdown format. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
+    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
     "parameters": {
         "type": "object",
         "properties": {

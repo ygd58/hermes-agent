@@ -21,6 +21,32 @@ model:
   base_url: "https://openrouter.ai/api/v1"
 
 # =============================================================================
+# OpenRouter Provider Routing (only applies when using OpenRouter)
+# =============================================================================
+# Control how requests are routed across providers on OpenRouter.
+# See: https://openrouter.ai/docs/guides/routing/provider-selection
+#
+# provider_routing:
+#   # Sort strategy: "price" (default), "throughput", or "latency"
+#   # Append :nitro to model name for a shortcut to throughput sorting.
+#   sort: "throughput"
+#
+#   # Only allow these providers (provider slugs from OpenRouter)
+#   # only: ["anthropic", "google"]
+#
+#   # Skip these providers entirely
+#   # ignore: ["deepinfra", "fireworks"]
+#
+#   # Try providers in this order (overrides default load balancing)
+#   # order: ["anthropic", "google", "together"]
+#
+#   # Require providers to support all parameters in your request
+#   # require_parameters: true
+#
+#   # Data policy: "allow" (default) or "deny" to exclude providers that may store data
+#   # data_collection: "deny"
+
+# =============================================================================
 # Terminal Tool Configuration
 # =============================================================================
 # Choose ONE of the following terminal configurations by uncommenting it.
@@ -185,6 +211,33 @@ memory:
   # lost (compression, /new, /reset, exit). Set to 0 to disable.
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
+
+# =============================================================================
+# Session Reset Policy (Messaging Platforms)
+# =============================================================================
+# Controls when messaging sessions (Telegram, Discord, WhatsApp, Slack) are
+# automatically cleared. Without resets, conversation context grows indefinitely
+# which increases API costs with every message.
+#
+# When a reset triggers, the agent first saves important information to its
+# persistent memory — but the conversation context is wiped. The agent starts
+# fresh but retains learned facts via its memory system.
+#
+# Users can always manually reset with /reset or /new in chat.
+#
+# Modes:
+#   "both"  - Reset on EITHER inactivity timeout or daily boundary (recommended)
+#   "idle"  - Reset only after N minutes of inactivity
+#   "daily" - Reset only at a fixed hour each day
+#   "none"  - Never auto-reset; context lives until /reset or compression kicks in
+#
+# When a reset triggers, the agent gets one turn to save important memories and
+# skills before the context is wiped. Persistent memory carries across sessions.
+#
+session_reset:
+  mode: both           # "both", "idle", "daily", or "none"
+  idle_minutes: 1440   # Inactivity timeout in minutes (default: 1440 = 24 hours)
+  at_hour: 4           # Daily reset hour, 0-23 local time (default: 4 AM)
 
 # =============================================================================
 # Skills Configuration
@@ -437,8 +490,22 @@ code_execution:
 # The delegate_task tool spawns child agents with isolated context.
 # Supports single tasks and batch mode (up to 3 parallel).
 delegation:
-  max_iterations: 50                          # Max tool-calling turns per child (default: 25)
+  max_iterations: 50                          # Max tool-calling turns per child (default: 50)
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets for subagents
+
+# =============================================================================
+# Honcho Integration (Cross-Session User Modeling)
+# =============================================================================
+# AI-native persistent memory via Honcho (https://honcho.dev/).
+# Builds a deeper understanding of the user across sessions and tools.
+# Runs alongside USER.md — additive, not a replacement.
+#
+# Requires: pip install honcho-ai
+# Config: ~/.honcho/config.json (shared with Claude Code, Cursor, etc.)
+# API key: HONCHO_API_KEY in ~/.hermes/.env or ~/.honcho/config.json
+#
+# Hermes-specific overrides (optional — most config comes from ~/.honcho/config.json):
+# honcho: {}
 
 # =============================================================================
 # Display
@@ -446,3 +513,11 @@ delegation:
 display:
   # Use compact banner mode
   compact: false
+
+  # Tool progress display level (CLI and gateway)
+  #   off:     Silent — no tool activity shown, just the final response
+  #   new:     Show a tool indicator only when the tool changes (skip repeats)
+  #   all:     Show every tool call with a short preview (default)
+  #   verbose: Full args, results, and debug logs (same as /verbose)
+  # Toggle at runtime with /verbose in the CLI
+  tool_progress: all
