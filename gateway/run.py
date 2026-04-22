@@ -804,19 +804,65 @@ class GatewayRunner:
 
         valid_modes = {"off", "voice_only", "all"}
         result = {}
+        legacy_keys: list = []
         for chat_id, mode in data.items():
             if mode not in valid_modes:
                 continue
             key = str(chat_id)
-            # Skip legacy unprefixed keys (warn and skip)
             if ":" not in key:
-                logger.warning(
-                    "Skipping legacy unprefixed voice mode key %r during migration. "
-                    "Re-enable voice mode on that chat to rebuild the prefixed key.",
-                    key,
-                )
+                legacy_keys.append((key, mode))
                 continue
             result[key] = mode
+
+        # Migrate legacy unprefixed keys instead of discarding them.
+        # Pre-#12542 entries have no platform prefix; we cannot know the
+        # original platform with certainty, but we CAN preserve the
+        # semantics by writing a prefixed entry for every connected
+        # messaging platform that has a matching chat_id.  If no adapters
+        # are loaded yet (e.g. called during __init__ before connect()),
+        # fall back to writing a "telegram:" prefix — Telegram is by far
+        # the most common source of legacy voice-off state, and a false
+        # positive (muting an unrelated platform's chat with the same id)
+        # is far less harmful than losing the suppression entirely (issue #14025).
+        if legacy_keys:
+            connected_platforms: list[str] = []
+            try:
+                connected_platforms = [
+                    p.value for p in self._adapters
+                    if hasattr(p, "value")
+                ] if hasattr(self, "_adapters") and self._adapters else []
+            except Exception:
+                pass
+            if not connected_platforms:
+                connected_platforms = ["telegram"]
+
+            for key, mode in legacy_keys:
+                migrated = False
+                for platform in connected_platforms:
+                    prefixed = f"{platform}:{key}"
+                    if prefixed not in result:
+                        result[prefixed] = mode
+                        migrated = True
+                        logger.info(
+                            "Migrated legacy voice mode key %r -> %r (platform: %s)",
+                            key, prefixed, platform,
+                        )
+                if not migrated:
+                    logger.warning(
+                        "Could not migrate legacy voice mode key %r — no connected platforms. "
+                        "Run /voice off on that chat to restore suppression.",
+                        key,
+                    )
+
+        # Persist migrated state so the legacy keys are not re-processed
+        # on the next restart.
+        if legacy_keys:
+            try:
+                self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                self._VOICE_MODE_PATH.write_text(json.dumps(result, indent=2))
+            except OSError as e:
+                logger.warning("Failed to persist migrated voice modes: %s", e)
+
         return result
 
     def _save_voice_modes(self) -> None:
