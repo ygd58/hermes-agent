@@ -1263,9 +1263,18 @@ setup_path() {
     if [ "$USE_VENV" = true ]; then
         HERMES_BIN="$INSTALL_DIR/venv/bin/hermes"
     else
-        HERMES_BIN="$(which hermes 2>/dev/null || echo "")"
+        # uv sync always creates a venv even when --no-venv is passed
+        # (uv has no --system flag for sync). Check the venv path first
+        # so the shim is created correctly (issue #31383).
+        if [ -x "$INSTALL_DIR/venv/bin/hermes" ]; then
+            HERMES_BIN="$INSTALL_DIR/venv/bin/hermes"
+            log_info "Note: uv created a venv despite --no-venv; using $HERMES_BIN"
+        else
+            HERMES_BIN="$(which hermes 2>/dev/null || echo "")"
+        fi
         if [ -z "$HERMES_BIN" ]; then
-            log_warn "hermes not found on PATH after install"
+            log_warn "hermes not found on PATH or at $INSTALL_DIR/venv/bin/hermes after install"
+            log_info "Try: cd $INSTALL_DIR && uv sync --extra all --locked"
             return 0
         fi
     fi
@@ -1273,11 +1282,11 @@ setup_path() {
     # Verify the entry point script was actually generated
     if [ ! -x "$HERMES_BIN" ]; then
         log_warn "hermes entry point not found at $HERMES_BIN"
-        log_info "This usually means the pip install didn't complete successfully."
+        log_info "This usually means the pip install did not complete successfully."
         if [ "$DISTRO" = "termux" ]; then
             log_info "Try: cd $INSTALL_DIR && python -m pip install -e '.[termux-all]' -c constraints-termux.txt"
         else
-            log_info "Try: cd $INSTALL_DIR && uv pip install -e '.[all]'"
+            log_info "Try: cd $INSTALL_DIR && uv sync --extra all --locked"
         fi
         return 0
     fi
