@@ -776,6 +776,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
+            {"key": "embed_database_url", "description": "Postgres URL for the embedded daemon's database (overrides the default per-profile pg0 instance)", "default": "", "env_var": "HINDSIGHT_EMBED_API_DATABASE_URL", "when": {"mode": "local_embedded"}},
         ]
 
     def _get_client(self):
