@@ -165,11 +165,18 @@ def _require_platform(platform_id: str) -> dict[str, Any]:
 
 
 def _platform_enablement(
-    platform_id: str, entry: dict[str, Any], env_on_disk: dict[str, str], scoped: bool
+    platform_id: str, entry: dict[str, Any], env_on_disk: dict[str, str], scoped: bool,
+    gateway_config: Optional[Any] = None,
 ) -> tuple[bool, bool, dict | None]:
     """(enabled, configured, home_channel). Profile-scoped: derive from the profile's
     config.yaml + .env only — load_gateway_config()'s env-override layer reads
-    os.environ and would leak the root install's tokens into the profile's state."""
+    os.environ and would leak the root install's tokens into the profile's state.
+
+    *gateway_config* lets the unscoped caller load once per request instead of once per
+    platform (#131658: N calls each re-parse config.yaml with pure-Python ruamel, ~0.65s/call
+    uncontended on a large config, inside the process-wide profile-scope lock — stalling every
+    other dashboard REST call). Falls back to a fresh load when not supplied.
+    """
     required = entry["required_env"]
     if scoped:
         configured = bool(required) and all(env_on_disk.get(key) for key in required)
@@ -187,11 +194,11 @@ def _platform_enablement(
     try:
         from gateway.config import Platform, load_gateway_config
 
-        gateway_config = load_gateway_config()
+        resolved_config = gateway_config if gateway_config is not None else load_gateway_config()
         platform = Platform(platform_id)
-        platform_config = gateway_config.platforms.get(platform)
+        platform_config = resolved_config.platforms.get(platform)
         enabled = bool(platform_config and platform_config.enabled)
-        configured = bool(platform_config and gateway_config._is_platform_connected(platform, platform_config))
+        configured = bool(platform_config and resolved_config._is_platform_connected(platform, platform_config))
         home_channel = platform_config.home_channel.to_dict() if platform_config and platform_config.home_channel else None
     except Exception:
         enabled, home_channel = False, None
@@ -201,7 +208,7 @@ def _platform_enablement(
 
 def _messaging_platform_payload(
     entry: dict[str, Any], env_on_disk: dict[str, str], runtime: dict | None,
-    scoped: bool = False, profile_home: Optional[Path] = None,
+    scoped: bool = False, profile_home: Optional[Path] = None, gateway_config: Optional[Any] = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     rt = runtime if isinstance(runtime, dict) else {}
@@ -240,7 +247,8 @@ def _messaging_platform_payload(
         for key, value in ((key, env_value(key)) for key in entry["env_vars"])
     ]
 
-    enabled, configured, home_channel = _platform_enablement(platform_id, entry, env_on_disk, scoped)
+    enabled, configured, home_channel = _platform_enablement(
+        platform_id, entry, env_on_disk, scoped, gateway_config=gateway_config)
     if gateway_running and runtime_platform.get("mirrored_from"):
         # Served secondary: the default's shared listener already answers this platform at
         # /p/<profile>/... (enabling it locally 409s), so the secondary's own empty config
@@ -306,8 +314,24 @@ def _platform_payloads(scoped_dir: Optional[Path], entries) -> list[dict[str, An
             # ``.hermes`` (or any custom HERMES_HOME), so its flat keys never matched (#123088).
             served_name = profile_name_for_home(own_home) or "default"
             runtime = {**served[1], "platforms": profile_platforms_from_multiplexer(served[1], served_name)}
-    return [_messaging_platform_payload(entry, env_on_disk, runtime, scoped=scoped_dir is not None, profile_home=scoped_dir)
-            for entry in entries]
+    gateway_config = None
+    if scoped_dir is None:
+        # Load once for the whole request, not once per platform (#131658): each load
+        # re-parses config.yaml with pure-Python ruamel, measured 0.65s/call uncontended on a
+        # large config -- N platforms means N parses of the same unchanged file, inside the
+        # process-wide profile-scope lock, stalling every other dashboard REST call.
+        try:
+            from gateway.config import load_gateway_config
+
+            gateway_config = load_gateway_config()
+        except Exception:
+            pass  # _platform_enablement falls back to its own per-platform load on None
+    return [
+        _messaging_platform_payload(
+            entry, env_on_disk, runtime, scoped=scoped_dir is not None,
+            profile_home=scoped_dir, gateway_config=gateway_config)
+        for entry in entries
+    ]
 
 
 @contextlib.contextmanager

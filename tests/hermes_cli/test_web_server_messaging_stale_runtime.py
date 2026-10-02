@@ -55,6 +55,29 @@ def test_stopped_gateway_does_not_report_stale_platform_error(client):
     assert telegram["error_message"] is None
 
 
+def test_platforms_request_loads_gateway_config_once_not_per_platform(client, monkeypatch):
+    """Regression for issue #131658: /api/messaging/platforms previously called
+    load_gateway_config() once per platform in the catalog (each a fresh, uncached
+    ruamel YAML parse of config.yaml), inside the process-wide profile-scope lock --
+    on a large config, measured 0.65s/call uncontended, stalling every other dashboard
+    REST call behind the lock. One request must load it at most once."""
+    import gateway.config as gateway_config_module
+
+    real_load = gateway_config_module.load_gateway_config
+    call_count = {"n": 0}
+
+    def counting_load():
+        call_count["n"] += 1
+        return real_load()
+
+    monkeypatch.setattr(gateway_config_module, "load_gateway_config", counting_load)
+
+    payload = client.get("/api/messaging/platforms").json()
+
+    assert len(payload["platforms"]) > 1, "need more than one platform for this test to be meaningful"
+    assert call_count["n"] <= 1, f"load_gateway_config() called {call_count['n']} times for one request"
+
+
 def test_operator_stopped_gateway_does_not_report_retained_startup_failure(client):
     """``hermes gateway stop`` keeps the last ``startup_failed`` + ``exit_reason`` on disk with
     ``desired_state: stopped``; the Channels page must read that as stopped, exactly like
