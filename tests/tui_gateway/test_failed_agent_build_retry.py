@@ -64,6 +64,47 @@ def test_restart_clears_failed_generation_and_rebuilds(tmp_path, monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_deferred_build_failure_logs_the_traceback(tmp_path, monkeypatch, caplog):
+    """Regression for issue #134890: a deferred-build exception (e.g. the reported bare
+    "maximum recursion depth exceeded") stored agent_error and emitted a user-facing
+    message, but the traceback was never logged -- so the failing frame could not be
+    identified from errors.log/agent.log/etc. after the fact."""
+    import logging
+
+    sid = "recursing-session"
+    ready = threading.Event()
+    session = {
+        "agent_ready": ready,
+        "agent_build_started": False,
+        "cwd": str(tmp_path),
+        "history": [],
+        "history_lock": threading.RLock(),
+        "profile_home": str(tmp_path),
+        "running": False,
+        "session_key": sid,
+    }
+    server._sessions[sid] = session
+
+    monkeypatch.setattr(server, "_bind_build_profile_scopes", lambda profile_home: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *a, **kw: (_ for _ in ()).throw(RecursionError("maximum recursion depth exceeded")))
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="tui_gateway.server"):
+            server._start_agent_build(sid, session)
+            assert ready.wait(timeout=5.0), "deferred build never completed"
+
+        assert session["agent_error"] == "maximum recursion depth exceeded"
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert "Deferred agent build failed" in logged
+        assert sid in logged
+        # caplog.records carries the formatted traceback via the record's own exc_text once
+        # rendered; check the record that logged it actually carries exception info.
+        assert any(record.exc_info is not None for record in caplog.records), \
+            "no record carries exc_info -- the traceback itself was not attached"
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_restart_declines_every_non_failure_state(tmp_path, monkeypatch):
     """False (caller falls through to the normal build) when there is no
     completed failure: healthy agent, build still in flight, or no error."""
