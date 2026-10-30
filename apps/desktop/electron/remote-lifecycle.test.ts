@@ -37,6 +37,7 @@ import {
   remotePidAlive,
   remoteSupportsSshOwnership,
   resolveReadyTimeoutMs,
+  sanitizeSpawnLogTail,
   scrapeReadyPort,
   spawnLogPath,
   spawnRemoteDashboard,
@@ -1848,6 +1849,173 @@ test('connect removes the token file when a fresh backend fails after returning 
 
   await assert.rejects(() => connect(connectDeps(ssh)), /Timed out waiting for the remote dashboard/i)
   assert.ok(ssh.calls.some(command => /rm -f .*\.token/.test(command)))
+})
+
+test('connect surfaces the spawn-log tail on a ready-timeout, read before cleanup deletes the log (#146389)', async () => {
+  // A host whose systemd-logind kills the session's children right after the spawn exec ends:
+  // the backend writes a few startup lines and is gone, never printing READY.
+  const logged: string[] = []
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '999\n'],
+    [/kill -0 999/, 'DEAD'],
+    [/tail -c \d+ .*\.log/, 'START argv: serve --isolated --port 0\nppid=1 parent=/sbin/init\n']
+  ])
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh, { rememberLog: (msg: string) => logged.push(msg) })),
+    (err: any) => {
+      assert.equal(err.kind, 'ready-timeout')
+      assert.match(err.message, /Timed out waiting for the remote dashboard/i)
+      assert.match(err.message, /Remote spawn log \(last lines\):\nSTART argv: serve --isolated --port 0\nppid=1/)
+      assert.equal(err.spawnLogTail, 'START argv: serve --isolated --port 0\nppid=1 parent=/sbin/init')
+
+      return true
+    }
+  )
+
+  // The tail must be read BEFORE cleanupStale removes the log -- afterwards there is nothing to read.
+  const tailAt = ssh.calls.findIndex(command => /tail -c \d+ .*\.log/.test(command))
+  // Whole-command match: the spawn payload is one long command that also contains `rm -f "$lock"`
+  // and a .log path, so an unanchored /rm -f .*\.log/ would match the spawn itself.
+  const removedAt = ssh.calls.findIndex(command => /^rm -f \S+\.log'?$/.test(command))
+  assert.ok(tailAt >= 0, 'spawn log tail was never read')
+  assert.ok(removedAt >= 0, 'cleanupStale never removed the spawn log -- the ordering check below would be vacuous')
+  assert.ok(tailAt < removedAt, 'spawn log was deleted before its tail was read')
+  // And it reaches desktop.log, not only the thrown error.
+  assert.ok(logged.some(line => line.includes('START argv: serve --isolated')))
+})
+
+test('sanitizeSpawnLogTail withholds prefixed credential assignments (the shapes #107689 missed)', () => {
+  const WITHHELD = '[line withheld: may contain a credential]'
+
+  for (const line of [
+    'GITHUB_TOKEN=ghp_testvalue123',
+    'AWS_SECRET_ACCESS_KEY=notarealkeyvalue',
+    'DB_PASSWORD=hunter2secret',
+    'MY_TOKEN = abcdef',
+    'export OPENAI_API_KEY="abc"',
+    'Authorization: Bearer abcdefghijklmnop',
+    'ssh -o IdentityFile=/home/u/.ssh/id_ed25519 host'
+  ]) {
+    assert.equal(sanitizeSpawnLogTail(line), WITHHELD, line)
+  }
+})
+
+test('sanitizeSpawnLogTail withholds a bare secret value that carries no keyword', () => {
+  for (const line of [
+    'cloning with ghp_abcdefghijklmnopqrstuvwxyz0123',
+    'key sk-abcdefghijklmnopqrstuvwx',
+    'AKIAABCDEFGHIJKLMNOP seen in env',
+    'webhook xoxb-1234567890-abcdefghij'
+  ]) {
+    assert.equal(sanitizeSpawnLogTail(line), '[line withheld: may contain a credential]', line)
+  }
+})
+
+test('sanitizeSpawnLogTail keeps an ordinary startup failure readable and bounded', () => {
+  const traceback = [
+    'Traceback (most recent call last):',
+    '  File "/opt/hermes/serve.py", line 12, in <module>',
+    'PermissionError: [Errno 13] Permission denied: \'/var/lib/hermes/state.db\''
+  ].join('\n')
+
+  assert.equal(sanitizeSpawnLogTail(traceback), traceback)
+  assert.equal(sanitizeSpawnLogTail('\x1b[31mERROR\x1b[0m: disk full\x07'), 'ERROR: disk full')
+  assert.equal(sanitizeSpawnLogTail(''), '')
+  assert.equal(sanitizeSpawnLogTail('x'.repeat(5000)).length, 300)
+
+  const many = Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n')
+  assert.deepEqual(sanitizeSpawnLogTail(many).split('\n'), Array.from({ length: 12 }, (_, i) => `line ${28 + i}`))
+})
+
+test('connect never puts a credential from the spawn log into the error or desktop.log (#146389)', async () => {
+  const logged: string[] = []
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '999\n'],
+    [/kill -0 999/, 'DEAD'],
+    [/tail -c \d+ .*\.log/, 'export GITHUB_TOKEN=ghp_testvalue123456789012345\nPermissionError: cannot bind port\n']
+  ])
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh, { rememberLog: (msg: string) => logged.push(msg) })),
+    (err: any) => {
+      assert.match(err.message, /PermissionError: cannot bind port/)
+      assert.doesNotMatch(err.message, /ghp_testvalue|GITHUB_TOKEN/)
+      assert.doesNotMatch(String(err.spawnLogTail), /ghp_testvalue|GITHUB_TOKEN/)
+
+      return true
+    }
+  )
+  assert.ok(logged.some(line => line.includes('PermissionError: cannot bind port')))
+  assert.ok(!logged.some(line => /ghp_testvalue|GITHUB_TOKEN/.test(line)), 'a credential reached desktop.log')
+})
+
+test('connect does not attach a spawn-log tail to a failure that happens after READY (#146389)', async () => {
+  // The daemon announced its port and forwarding worked; it died while the served token was being
+  // resolved. That is spawn-failed too, but the log holds a healthy startup, not an explanation.
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/printf '%s\\n'/, ''],
+    [/setsid/, '777\n'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=51999\n'],
+    [/kill -0 777/, 'DEAD'],
+    [/tail -c \d+ .*\.log/, 'HERMES_DASHBOARD_READY port=51999\n']
+  ])
+
+  await assert.rejects(
+    // Default adoptServedToken returns the minted spawn token, so the dead-daemon branch is
+    // 'spawn-failed' (a different served token would classify it 'foreign-backend').
+    () => connect(connectDeps(ssh)),
+    (err: any) => {
+      assert.equal(err.kind, 'spawn-failed')
+      assert.match(err.message, /exited while its served token was being resolved/)
+      assert.doesNotMatch(err.message, /Remote spawn log/)
+      assert.equal(err.spawnLogTail, undefined)
+
+      return true
+    }
+  )
+  assert.ok(!ssh.calls.some(command => /tail -c \d+ .*\.log/.test(command)), 'spawn log was read for a post-READY failure')
+})
+
+test('connect keeps the original ready-timeout message when the spawn log is empty (#146389)', async () => {
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '999\n'],
+    [/kill -0 999/, 'DEAD'],
+    [/tail -c \d+ .*\.log/, '']
+  ])
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh)),
+    (err: any) => {
+      assert.equal(err.kind, 'ready-timeout')
+      assert.doesNotMatch(err.message, /Remote spawn log/)
+      assert.equal(err.spawnLogTail, undefined)
+
+      return true
+    }
+  )
 })
 
 test('connect preserves an exact-owned backend when reuse proof transport fails', async () => {

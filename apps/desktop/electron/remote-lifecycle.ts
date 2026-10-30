@@ -1252,6 +1252,52 @@ function remoteProfileMissingError(output) {
   return err
 }
 
+const SPAWN_LOG_TAIL_BYTES = 4096
+const SPAWN_LOG_TAIL_LINES = 12
+const SPAWN_LOG_LINE_MAX_CHARS = 300
+const SPAWN_LOG_WITHHELD_LINE = '[line withheld: may contain a credential]'
+
+// A credential-ish keyword ANYWHERE in the line (not only at its start: `GITHUB_TOKEN=...`,
+// `AWS_SECRET_ACCESS_KEY=...`, `DB_PASSWORD=...` and `MY_TOKEN = ...` are all prefixed), or a
+// recognisable bare secret value. The whole line is withheld rather than masked.
+const SPAWN_LOG_SECRET_RE = new RegExp(
+  '(?:token|secret|passw(?:or)?d|api[_-]?key|authorization|bearer|credential|private[_ -]?key|identityfile)' +
+    '|(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})',
+  'i'
+)
+
+// eslint-disable-next-line no-control-regex
+const SPAWN_LOG_ANSI_OR_CONTROL_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g
+
+/** Turn a raw remote spawn-log tail into something safe to put in an error message and in
+ *  desktop.log: ANSI/control characters stripped, lines that may carry a credential withheld,
+ *  each line length-capped, only the last few lines kept. The closed #107689 attempt at surfacing
+ *  this log was withdrawn partly because its redaction missed prefixed assignments, so a secret
+ *  echoed into a spawn log reached the UI -- desktop.log is also routinely pasted into public bug
+ *  reports, so this runs before EVERY surface, not just the user-facing one. */
+function sanitizeSpawnLogTail(raw) {
+  return String(raw || '')
+    .replace(SPAWN_LOG_ANSI_OR_CONTROL_RE, '')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(Boolean)
+    .map(line => (SPAWN_LOG_SECRET_RE.test(line) ? SPAWN_LOG_WITHHELD_LINE : line.slice(0, SPAWN_LOG_LINE_MAX_CHARS)))
+    .slice(-SPAWN_LOG_TAIL_LINES)
+    .join('\n')
+}
+
+/** Last lines of the remote spawn log, for a boot that failed. Best-effort and bounded: the
+ *  failure path must never be made worse by trying to explain itself. */
+async function readSpawnLogTail(ssh, logPath) {
+  try {
+    return sanitizeSpawnLogTail(
+      await ssh.exec(`tail -c ${SPAWN_LOG_TAIL_BYTES} ${expandRemotePath(logPath)} 2>/dev/null || true`)
+    )
+  } catch {
+    return ''
+  }
+}
+
 async function scrapeReadyPort(ssh, logPath, { timeoutMs = resolveReadyTimeoutMs(), isAlive, signal }: any = {}) {
   const deadline = Date.now() + timeoutMs
   const remoteLog = expandRemotePath(logPath)
@@ -1779,6 +1825,23 @@ async function connect(deps) {
       void 0
     }
 
+    // cleanupStale below deletes the spawn log, and for a boot that never announced its port (or
+    // exited first) that log is the only diagnostic there is. Read its tail before it goes, so
+    // the user sees why -- e.g. a host whose systemd-logind kills the session's children right
+    // after the spawn exec ends leaves a log that just stops (#146389) -- instead of a bare
+    // timeout that reads like a slow host. Only while the READY wait never completed
+    // (!remotePort): adoptOwnedServedToken also throws spawn-failed, but after the port was
+    // announced and forwarded, where the log is a healthy startup rather than an explanation.
+    if (!remotePort && (error?.kind === 'ready-timeout' || error?.kind === 'spawn-failed')) {
+      const spawnLogTail = await readSpawnLogTail(ssh, logPath)
+
+      if (spawnLogTail) {
+        log(`remote spawn log (last lines) before cleanup:\n${spawnLogTail}`)
+        error.spawnLogTail = spawnLogTail
+        error.message = `${error.message}\n\nRemote spawn log (last lines):\n${spawnLogTail}`
+      }
+    }
+
     // This record IS the child this attempt spawned. A liveness probe that
     // cannot be settled must not become "leave it running": assume alive so
     // cleanupStale re-runs the ownership proof, which keeps the record when
@@ -1833,6 +1896,7 @@ export {
   remoteSupportsSshOwnership,
   removeLockfile,
   resolveReadyTimeoutMs,
+  sanitizeSpawnLogTail,
   scrapeReadyPort,
   shq,
   spawnLogPath,
