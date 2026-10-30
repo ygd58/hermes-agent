@@ -779,6 +779,36 @@ class TestSendTelegramHtmlDetection:
         sleep_mock.assert_awaited_once()
 
 
+def _ptb_error(name, message, base=Exception):
+    """An exception shaped like python-telegram-bot's (class name + ``telegram.error`` module), without PTB.
+    PTB's BadRequest subclasses NetworkError, which is why a type check alone can't tell a parse error from a
+    gateway failure."""
+    cls = type(name, (base,), {"__module__": "telegram.error"})
+    return cls(message)
+
+
+class TestTelegramParseErrorIsNotRetriedAsTransient:
+    """#146922: a parse error carrying status-looking digits must go straight to the plain-text fallback."""
+
+    def test_parse_error_with_status_digits_falls_back_without_backoff(self, monkeypatch):
+        bot = MagicMock()
+        parse_error = _ptb_error(
+            "BadRequest",
+            "Can't parse entities: Can't find end of the entity starting at byte offset 502",
+        )
+        bot.send_message = AsyncMock(side_effect=[parse_error, SimpleNamespace(message_id=2)])
+        _install_telegram_mock(monkeypatch, bot)
+
+        with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            result = asyncio.run(_send_telegram("tok", "123", "<b>hello</b>"))
+
+        assert result["success"] is True
+        assert bot.send_message.await_count == 2
+        sleep_mock.assert_not_awaited()  # no [1.0, 2.0] backoff before the fallback
+        assert bot.send_message.await_args_list[0].kwargs["parse_mode"] == "HTML"
+        assert bot.send_message.await_args_list[1].kwargs["parse_mode"] is None  # plain-text fallback
+
+
 class TestSendTelegramThreadIdMapping:
     """General-topic mapping in _send_telegram (issue #22267).
 

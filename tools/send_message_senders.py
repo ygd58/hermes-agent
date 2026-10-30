@@ -63,23 +63,43 @@ def _success(platform: str, chat_id, warnings=None, **fields) -> dict:
 
 _NO_DELIVERABLE = "No deliverable text or media remained after processing MEDIA tags"
 
-_TELEGRAM_TRANSIENT_MARKERS = ("bad gateway", "502", "too many requests", "429", "service unavailable", "503",
-                               "gateway timeout", "504")
+_TELEGRAM_TRANSIENT_PHRASES = ("bad gateway", "too many requests", "service unavailable", "gateway timeout")
+# Status codes match as whole numbers only: "502" inside "byte offset 5029" or "message 14290" is not a status.
+_TELEGRAM_TRANSIENT_STATUS_RE = re.compile(r"(?<!\d)(?:429|502|503|504)(?!\d)")
+# Telegram's own definitive answers (python-telegram-bot's HTTP-400/403/409 family): retrying cannot change them.
+_TELEGRAM_DEFINITIVE_ERROR_NAMES = frozenset({"BadRequest", "Forbidden", "InvalidToken", "Conflict", "ChatMigrated"})
+_TELEGRAM_PARSE_ERROR_RE = re.compile(r"can'?t parse")
+
+
+def _telegram_is_definitive_failure(exc: Exception) -> bool:
+    """True for an answer Telegram has already given (a parse/entity rejection, a 400/403/409): never
+    transient, whatever digits its message happens to carry (#146922: "...starting at byte offset 502").
+    Classes are matched by name + module over the MRO, not isinstance, so this needs no ``telegram`` import
+    (python-telegram-bot is optional and is mocked in tests); a plain exception carrying Telegram's
+    "can't parse ..." wording is covered by the message check."""
+    if any(cls.__name__ in _TELEGRAM_DEFINITIVE_ERROR_NAMES and str(getattr(cls, "__module__", "")).startswith("telegram")
+           for cls in type(exc).__mro__):
+        return True
+    return bool(_TELEGRAM_PARSE_ERROR_RE.search(str(exc).lower()))
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
-    """Retry delay in seconds, or None when final: honours ``retry_after``; timeouts are
-    never retried (the send may have gone through); 5xx/429 back off exponentially."""
+    """Retry delay in seconds, or None when final: honours ``retry_after``; a definitive Telegram answer
+    (parse error, 400/403/409) is never retried; timeouts are never retried (the send may have gone
+    through); a genuine 5xx/429 backs off exponentially."""
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
         try:
             return max(float(retry_after), 0.0)
         except (TypeError, ValueError):
             return 1.0
+    if _telegram_is_definitive_failure(exc):
+        return None
     text = str(exc).lower()
     if "timed out" in text or "timeout" in text:
         return None
-    return float(2 ** attempt) if any(marker in text for marker in _TELEGRAM_TRANSIENT_MARKERS) else None
+    transient = any(phrase in text for phrase in _TELEGRAM_TRANSIENT_PHRASES) or _TELEGRAM_TRANSIENT_STATUS_RE.search(text)
+    return float(2 ** attempt) if transient else None
 
 
 async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
