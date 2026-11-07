@@ -1215,15 +1215,18 @@ class TestImapIdExtensionForNetEase(unittest.TestCase):
 class TestConnectSmtp(unittest.TestCase):
     """Test _connect_smtp() helper: protocol selection and IPv6 fallback."""
 
-    def _make_adapter(self, port="587"):
+    def _make_adapter(self, port="587", security=None):
         from gateway.config import PlatformConfig
-        with patch.dict(os.environ, {
+        env = {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
             "EMAIL_SMTP_PORT": port,
-        }):
+        }
+        if security:
+            env["EMAIL_SMTP_SECURITY"] = security
+        with patch.dict(os.environ, env):
             from plugins.platforms.email.adapter import EmailAdapter
             return EmailAdapter(PlatformConfig(enabled=True))
 
@@ -1264,6 +1267,81 @@ class TestConnectSmtp(unittest.TestCase):
             mock_ipv4_smtp_ssl.assert_called_once_with(
                 "smtp.test.com", 465, timeout=30, context=ANY,
             )
+
+
+    # ── #150806: the default SMTP security follows the port *convention*, not just the literal 465 ──
+
+    def test_default_follows_the_port_convention(self):
+        for port, expected in [
+            ("465", "tls"), ("10465", "tls"), ("4465", "tls"), ("1465", "tls"),
+            ("587", "starttls"), ("25", "starttls"), ("2525", "starttls"),
+            ("4650", "starttls"),  # contains 465 but is not a <prefix>465 port
+        ]:
+            with self.subTest(port=port):
+                self.assertEqual(self._make_adapter(port)._smtp_security, expected)
+
+    def test_explicit_security_still_wins_over_the_port_default(self):
+        self.assertEqual(self._make_adapter("10465", security="starttls")._smtp_security, "starttls")
+        self.assertEqual(self._make_adapter("587", security="tls")._smtp_security, "tls")
+
+    def test_implicit_tls_alternate_port_connects_with_smtp_ssl_not_a_plaintext_banner_wait(self):
+        adapter = self._make_adapter("10465")
+
+        with patch("smtplib.SMTP_SSL") as ssl_cls, patch("smtplib.SMTP") as plain_cls:
+            ssl_cls.return_value = MagicMock()
+            result = adapter._connect_smtp()
+
+        self.assertIs(result, ssl_cls.return_value)
+        self.assertEqual(ssl_cls.call_args.args[:2], ("smtp.test.com", 10465))
+        plain_cls.assert_not_called()  # a plaintext connect here is what hung for 2x30s
+
+    def test_standalone_send_uses_implicit_tls_on_a_mirrored_465_port(self):
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+
+        env = {
+            "EMAIL_ADDRESS": "hermes@test.com", "EMAIL_PASSWORD": "secret",
+            "EMAIL_SMTP_HOST": "smtp.test.com", "EMAIL_SMTP_PORT": "10465",
+        }
+        pconfig = SimpleNamespace(token=None, api_key=None,
+                                  extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"})
+        with patch.dict(os.environ, env), patch("smtplib.SMTP_SSL") as ssl_cls, patch("smtplib.SMTP") as plain_cls:
+            ssl_cls.return_value = MagicMock()
+            result = asyncio.run(_standalone_send(pconfig, "user@test.com", "Hello"))
+
+        self.assertTrue(result["success"])
+        ssl_cls.assert_called_once()
+        plain_cls.assert_not_called()
+
+    def _probe_failure_detail(self, adapter, exc):
+        with patch.object(adapter, "_connect_smtp", side_effect=exc), \
+                patch.object(adapter, "_set_fatal_error") as fatal:
+            self.assertFalse(adapter._probe_smtp())
+        return fatal.call_args.args[1]
+
+    def test_starttls_timeout_names_the_implicit_tls_override(self):
+        import smtplib
+
+        for exc in (smtplib.SMTPServerDisconnected("Connection unexpectedly closed: timed out"),
+                    TimeoutError("timed out"), ConnectionResetError("reset")):
+            with self.subTest(exc=type(exc).__name__):
+                detail = self._probe_failure_detail(self._make_adapter("2587"), exc)
+                self.assertIn("EMAIL_SMTP_SECURITY=tls", detail)
+                self.assertIn("port 2587", detail)
+                self.assertIn(str(exc), detail)  # the original error is kept, the hint only added
+
+    def test_no_hint_when_it_cannot_apply(self):
+        import smtplib
+
+        # Already implicit TLS: the hint would be wrong advice.
+        detail = self._probe_failure_detail(self._make_adapter("465"), TimeoutError("timed out"))
+        self.assertNotIn("EMAIL_SMTP_SECURITY", detail)
+        # An error that is not a "no banner" symptom.
+        detail = self._probe_failure_detail(self._make_adapter("587"), ValueError("bad host"))
+        self.assertNotIn("EMAIL_SMTP_SECURITY", detail)
+        detail = self._probe_failure_detail(self._make_adapter("587"), smtplib.SMTPConnectError(421, "busy"))
+        self.assertNotIn("EMAIL_SMTP_SECURITY", detail)
 
 
 class TestConnectionConfigResolution(unittest.TestCase):

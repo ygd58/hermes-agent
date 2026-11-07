@@ -109,6 +109,17 @@ def _normalize_security(value: Any, default: str = "tls") -> str:
     return _SECURITY_ALIASES.get(raw, default)
 
 
+def _default_smtp_security(port: int) -> str:
+    """Default SMTP security when none is configured: ``tls`` (implicit TLS) for 465 and for the ports that
+    mirror it as ``<prefix>465`` (10465, 4465, ...), ``starttls`` otherwise (587, 25, 2525).
+
+    A plaintext connect to an implicit-TLS listener waits for a ``220`` banner it never sends, so a wrong
+    guess here shows up as a connect timeout, not as a downgrade -- both wrong guesses still require TLS,
+    which is why guessing from the port convention is acceptable. Keep this the ONE place that decides:
+    the adapter and the standalone sender each carried their own ``port == 465`` copy (#150806)."""
+    return "tls" if str(port).endswith("465") else "starttls"
+
+
 def _tls_context(verify: bool, host: str) -> ssl.SSLContext:
     """Verified context by default; unverified only when explicitly opted out."""
     if verify:
@@ -476,7 +487,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._imap_tls_verify = tls_verify("EMAIL_IMAP_TLS_VERIFY", "imap_tls_verify")
         self._smtp_host = setting("EMAIL_SMTP_HOST", "smtp_host").strip()
         self._smtp_port = _esecret_int("EMAIL_SMTP_PORT", 587)
-        self._smtp_security = _normalize_security(setting("EMAIL_SMTP_SECURITY", "smtp_security"), default="tls" if self._smtp_port == 465 else "starttls")
+        self._smtp_security = _normalize_security(setting("EMAIL_SMTP_SECURITY", "smtp_security"), default=_default_smtp_security(self._smtp_port))
         self._smtp_tls_verify = tls_verify("EMAIL_SMTP_TLS_VERIFY", "smtp_tls_verify")
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
         self._skip_attachments = extra.get("skip_attachments", False)  # platforms.email.skip_attachments
@@ -599,8 +610,18 @@ class EmailAdapter(BasePlatformAdapter):
                               f"SMTP authentication failed for {self._address}: {e}. Check EMAIL_PASSWORD (for Gmail/Outlook "
                               "this must be an app password, not the account password).", retryable=False)
         except Exception as e:
-            return self._fail("[Email] SMTP connection failed: %s", e, "email_smtp_connect_error",
-                              f"SMTP connection to {self._smtp_host} failed: {e}", retryable=True)
+            detail = f"{e}{self._smtp_tls_hint(e)}"
+            return self._fail("[Email] SMTP connection failed: %s", detail, "email_smtp_connect_error",
+                              f"SMTP connection to {self._smtp_host} failed: {detail}", retryable=True)
+
+    def _smtp_tls_hint(self, exc: BaseException) -> str:
+        """A STARTTLS connect to an implicit-TLS port waits for a banner that never arrives, so it surfaces as
+        a bare timeout / "Connection unexpectedly closed" (#150806). The port heuristic cannot know every
+        provider's alternate port; name the fix instead of leaving only the timeout."""
+        if self._smtp_security != "starttls" or not isinstance(
+                exc, (TimeoutError, smtplib.SMTPServerDisconnected, ConnectionError)):
+            return ""
+        return f" (if port {self._smtp_port} is an implicit-TLS port, set EMAIL_SMTP_SECURITY=tls)"
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the IMAP server and start polling for new messages."""
@@ -969,7 +990,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     extra = getattr(pconfig, "extra", {}) or {}
     address, password = extra.get("address") or _get_secret("EMAIL_ADDRESS", ""), _get_secret("EMAIL_PASSWORD", "")
     smtp_host, smtp_port = extra.get("smtp_host") or _get_secret("EMAIL_SMTP_HOST", ""), _esecret_int("EMAIL_SMTP_PORT", 587)
-    smtp_security = _normalize_security(_get_secret("EMAIL_SMTP_SECURITY", "") or extra.get("smtp_security"), default="tls" if smtp_port == 465 else "starttls")
+    smtp_security = _normalize_security(_get_secret("EMAIL_SMTP_SECURITY", "") or extra.get("smtp_security"), default=_default_smtp_security(smtp_port))
     smtp_tls_verify = _esecret_bool("EMAIL_SMTP_TLS_VERIFY", is_truthy_value(extra.get("smtp_tls_verify"), default=True))
     if not all([address, password, smtp_host]):
         return send_error("Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)")
